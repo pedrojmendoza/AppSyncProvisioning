@@ -1,0 +1,228 @@
+Parameters:
+  ProjectName:
+    Type: String
+  Env:
+    Type: String
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Env}-LambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: !Sub ${ProjectName}-${Env}-LambdaExecutionRoleLogAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:*
+            Resource: arn:aws:logs:*:*:*
+  AppSyncServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Env}-AppSyncServiceRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - appsync.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: !Sub ${ProjectName}-${Env}-AppSyncLambdaInvokePolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:*
+            Resource: "*"
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Env}-LambdaFunction
+      Handler: index.handler
+      Runtime: nodejs6.10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: !Sub |
+          exports.handler = (event, context, callback) => {
+            console.log("Received event {}", JSON.stringify(event, 3));
+            var posts = {
+                "1": {"id": "1", "title": "First book", "author": "Author1", "url": "https://amazon.com/", "content": "SAMPLE TEXT AUTHOR 1 SAMPLE TEXT AUTHOR 1 SAMPLE TEXT AUTHOR 1 SAMPLE TEXT AUTHOR 1 SAMPLE TEXT AUTHOR 1 SAMPLE TEXT AUTHOR 1", "ups": "100", "downs": "10"},
+                "2": {"id": "2", "title": "Second book", "author": "Author2", "url": "https://amazon.com", "content": "SAMPLE TEXT AUTHOR 2 SAMPLE TEXT AUTHOR 2 SAMPLE TEXT", "ups": "100", "downs": "10"},
+                "3": {"id": "3", "title": "Third book", "author": "Author3", "url": null, "content": null, "ups": null, "downs": null },
+                "4": {"id": "4", "title": "Fourth book", "author": "Author4", "url": "https://www.amazon.com/", "content": "SAMPLE TEXT AUTHOR 4 SAMPLE TEXT AUTHOR 4 SAMPLE TEXT AUTHOR 4 SAMPLE TEXT AUTHOR 4 SAMPLE TEXT AUTHOR 4 SAMPLE TEXT AUTHOR 4 SAMPLE TEXT AUTHOR 4 SAMPLE TEXT AUTHOR 4", "ups": "1000", "downs": "0"},
+                "5": {"id": "5", "title": "Fifth book", "author": "Author5", "url": "https://www.amazon.com/", "content": "SAMPLE TEXT AUTHOR 5 SAMPLE TEXT AUTHOR 5 SAMPLE TEXT AUTHOR 5 SAMPLE TEXT AUTHOR 5 SAMPLE TEXT", "ups": "50", "downs": "0"} };
+
+            var relatedPosts = {
+                "1": [posts['4']],
+                "2": [posts['3'], posts['5']],
+                "3": [posts['2'], posts['1']],
+                "4": [posts['2'], posts['1']],
+                "5": []
+            };
+
+            console.log("Got an Invoke Request.");
+            switch(event.field) {
+                case "getPost":
+                    var id = event.arguments.id;
+                    callback(null, posts[id]);
+                    break;
+                case "allPosts":
+                    var values = [];
+                    for(var d in posts){
+                        values.push(posts[d]);
+                    }
+                    callback(null, values);
+                    break;
+                case "addPost":
+                    // return the arguments back
+                    callback(null, event.arguments);
+                    break;
+                case "addPostErrorWithData":
+                    var id = event.arguments.id;
+                    var result = posts[id];
+                    // attached additional error information to the post
+                    result.errorMessage = 'Error with the mutation, data has changed';
+                    result.errorType = 'MUTATION_ERROR';
+                    callback(null, result);
+                    break;
+                case "relatedPosts":
+                    var id = event.source.id;
+                    callback(null, relatedPosts[id]);
+                    break;
+                default:
+                    callback("Unknown field, unable to resolve" + event.field, null);
+                    break;
+              }
+          };
+  GraphQlApi:
+    Type: AWS::AppSync::GraphQLApi
+    Properties:
+      Name: !Sub ${ProjectName}-${Env}-Api
+      AuthenticationType: "AWS_IAM"
+  GraphQlDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !GetAtt GraphQlApi.ApiId
+      Name: Datasource
+      Description: "Datasource connecting to the lambda backing the AppSync API"
+      Type: "AWS_LAMBDA"
+      ServiceRoleArn: !GetAtt AppSyncServiceRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt LambdaFunction.Arn
+  GraphQlSchema:
+    Type: AWS::AppSync::GraphQLSchema
+    Properties:
+      ApiId: !GetAtt GraphQlApi.ApiId
+      Definition: !Sub |
+        schema {
+            query: Query
+            mutation: Mutation
+        }
+
+        type Query {
+            getPost(id:ID!): Post
+            allPosts: [Post]
+        }
+
+        type Mutation {
+            addPost(id: ID!, author: String!, title: String, content: String, url: String): Post!
+        }
+
+        type Post {
+            id: ID!
+            author: String!
+            title: String
+            content: String
+            url: String
+            ups: Int
+            downs: Int
+            relatedPosts: [Post]
+        }
+  GetPostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQlApi.ApiId
+      TypeName: Query
+      FieldName: getPost
+      DataSourceName: !GetAtt GraphQlDataSource.Name
+      RequestMappingTemplate: !Sub |
+        {
+            "version": "2017-02-28",
+            "operation": "Invoke",
+            "payload": {
+                "field": "getPost",
+                "arguments":  $utils.toJson($context.arguments)
+            }
+        }                    
+      ResponseMappingTemplate: !Sub |
+        $utils.toJson($context.result)
+  AllPostsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQlApi.ApiId
+      TypeName: Query
+      FieldName: allPosts
+      DataSourceName: !GetAtt GraphQlDataSource.Name
+      RequestMappingTemplate: !Sub |
+        {
+            "version": "2017-02-28",
+            "operation": "Invoke",
+            "payload": {
+                "field": "allPosts"
+            }
+        }                    
+      ResponseMappingTemplate: !Sub |
+        $utils.toJson($context.result)
+  AddPostResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQlApi.ApiId
+      TypeName: Mutation
+      FieldName: addPost
+      DataSourceName: !GetAtt GraphQlDataSource.Name
+      RequestMappingTemplate: !Sub |
+        {
+            "version": "2017-02-28",
+            "operation": "Invoke",
+            "payload": {
+                "field": "addPost",
+                "arguments":  $utils.toJson($context.arguments)
+            }
+        }                    
+      ResponseMappingTemplate: !Sub |
+        $utils.toJson($context.result)
+  RelatedPostsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !GetAtt GraphQlApi.ApiId
+      TypeName: Post
+      FieldName: relatedPosts
+      DataSourceName: !GetAtt GraphQlDataSource.Name
+      RequestMappingTemplate: !Sub |
+        {
+            "version": "2017-02-28",
+            "operation": "Invoke",
+            "payload": {
+                "field": "relatedPosts",
+                "source":  $utils.toJson($context.source)
+            }
+        }                    
+      ResponseMappingTemplate: !Sub |
+        $utils.toJson($context.result)
